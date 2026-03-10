@@ -387,3 +387,215 @@
                                     acc
                                     (split-semicolon joined))]
               (recur (inc i) [] acc))))))))
+
+;; ---------------------------------------------------------------------------
+;; Step 2: Expression parser — shunting-yard
+;;
+;; Implements the expression grammar.
+;; Takes a seq of token maps from `tokenize` (Newline/Eof already removed),
+;; returns a vector of tokens in postfix (RPN) order.
+;;
+;; Reduce condition (from the language specification):
+;;   while existing-op.lp >= incoming-op.rp  → reduce
+;; ---------------------------------------------------------------------------
+
+;; Precedence table: op-kind → [lp rp]
+(def ^:private prec-table
+  {:sc/op-assign    [1  2]   ; right-assoc
+   :sc/op-question  [2  2]
+   :sc/op-pipe      [3  3]
+   :sc/op-or        [4  4]
+   :sc/op-concat    [5  5]
+   :sc/op-eq        [6  6]
+   :sc/op-ne        [6  6]
+   :sc/op-lt        [6  6]
+   :sc/op-gt        [6  6]
+   :sc/op-le        [6  6]
+   :sc/op-ge        [6  6]
+   :sc/op-str-ident  [6  6]
+   :sc/op-str-differ [6  6]
+   :sc/op-str-lt    [6  6]
+   :sc/op-str-gt    [6  6]
+   :sc/op-str-le    [6  6]
+   :sc/op-str-ge    [6  6]
+   :sc/op-str-eq    [6  6]
+   :sc/op-str-ne    [6  6]
+   :sc/op-plus      [7  7]
+   :sc/op-minus     [7  7]
+   :sc/op-slash     [8  8]
+   :sc/op-star      [8  8]
+   :sc/op-percent   [8  8]
+   :sc/op-caret     [9  10]  ; right-assoc
+   :sc/op-period    [10 10]
+   :sc/op-dollar    [10 10]})
+
+;; Unary operator set — ANY("+-*&@~?.$") from the language specification
+(def ^:private unary-ops
+  #{:sc/op-plus :sc/op-minus :sc/op-star :sc/op-ampersand
+    :sc/op-at   :sc/op-tilde :sc/op-question :sc/op-period :sc/op-dollar})
+
+(def ^:private operand-kinds
+  #{:sc/identifier :sc/integer :sc/real :sc/string})
+
+(defn- operand? [tok] (contains? operand-kinds (:kind tok)))
+(defn- binary?  [tok] (contains? prec-table (:kind tok)))
+(defn- unary?   [tok] (contains? unary-ops  (:kind tok)))
+
+(defn- unary-position?
+  "True if index i is in unary position (start, or previous token was op/open)."
+  [tokens i]
+  (if (zero? i)
+    true
+    (let [prev (:kind (nth tokens (dec i)))]
+      (or (= prev :sc/lparen)
+          (= prev :sc/lbracket)
+          (= prev :sc/comma)
+          (contains? prec-table prev)
+          (contains? unary-ops  prev)))))
+
+;; dotck: rewrite leading-dot real to prepend "0."
+(defn- dotck [tok]
+  (if (and (= (:kind tok) :sc/real)
+           (clojure.string/starts-with? (:text tok) "."))
+    (assoc tok :text (str "0" (:text tok)))
+    tok))
+
+(defn parse-expression
+  "Parse a flat infix token vector into postfix (RPN).
+  Returns a vector of token maps; synthetic call/array-ref nodes carry
+  :arg-count and (for unary ops) :unary? true."
+  [tokens]
+  (let [tokens (vec tokens)
+        n      (count tokens)]
+    (loop [i          0
+           output     []
+           op-stack   []    ; binary ops waiting to be flushed
+           call-stack []]   ; frames: {:kind :call/:array/:group :arg-count N :output-start M}
+      (if (>= i n)
+        ;; Drain remaining ops
+        (into output (reverse op-stack))
+
+        (let [tok  (dotck (nth tokens i))
+              kind (:kind tok)
+              next-kind (when (< (inc i) n) (:kind (nth tokens (inc i))))]
+          (cond
+            ;; ---- Operand ----
+            (operand? tok)
+            (cond
+              ;; identifier followed by ( → function call
+              (and (= kind :sc/identifier) (= next-kind :sc/lparen))
+              (recur (+ i 2)
+                     (conj output tok)
+                     (conj op-stack {:kind :sc/lparen :text "(" :line (:line tok)})
+                     (conj call-stack {:kind :call :arg-count 0
+                                       :output-start (inc (count output))}))
+
+              ;; identifier followed by [ → array ref
+              (and (= kind :sc/identifier) (= next-kind :sc/lbracket))
+              (recur (+ i 2)
+                     (conj output tok)
+                     (conj op-stack {:kind :sc/lbracket :text "[" :line (:line tok)})
+                     (conj call-stack {:kind :array :arg-count 0
+                                       :output-start (inc (count output))}))
+
+              :else
+              (recur (inc i) (conj output tok) op-stack call-stack))
+
+            ;; ---- Left paren (grouping) ----
+            (= kind :sc/lparen)
+            (recur (inc i) output
+                   (conj op-stack tok)
+                   (conj call-stack {:kind :group :arg-count 0
+                                     :output-start (count output)}))
+
+            ;; ---- Right paren ----
+            (= kind :sc/rparen)
+            (let [[flushed rest-ops] (split-with #(not= (:kind %) :sc/lparen) op-stack)
+                  new-output (into output (reverse flushed))
+                  new-ops    (if (seq rest-ops) (vec (rest rest-ops)) [])
+                  frame      (peek call-stack)
+                  new-calls  (if (seq call-stack) (pop call-stack) [])
+                  has-args?  (> (count new-output) (:output-start frame 0))
+                  arg-count  (if has-args? (inc (:arg-count frame 0)) 0)
+                  new-output (if (= (:kind frame) :call)
+                               (conj new-output {:kind :sc/sc-call :text "()"
+                                                 :line (:line tok) :arg-count arg-count})
+                               new-output)]
+              (recur (inc i) new-output new-ops new-calls))
+
+            ;; ---- Left bracket ----
+            (= kind :sc/lbracket)
+            (recur (inc i) output
+                   (conj op-stack tok)
+                   (conj call-stack {:kind :group :arg-count 0
+                                     :output-start (count output)}))
+
+            ;; ---- Right bracket ----
+            (= kind :sc/rbracket)
+            (let [[flushed rest-ops] (split-with #(not= (:kind %) :sc/lbracket) op-stack)
+                  new-output (into output (reverse flushed))
+                  new-ops    (if (seq rest-ops) (vec (rest rest-ops)) [])
+                  frame      (peek call-stack)
+                  new-calls  (if (seq call-stack) (pop call-stack) [])
+                  has-args?  (> (count new-output) (:output-start frame 0))
+                  arg-count  (if has-args? (inc (:arg-count frame 0)) 0)
+                  new-output (if (= (:kind frame) :array)
+                               (conj new-output {:kind :sc/sc-array-ref :text "[]"
+                                                 :line (:line tok) :arg-count arg-count})
+                               new-output)]
+              (recur (inc i) new-output new-ops new-calls))
+
+            ;; ---- Comma ----
+            (= kind :sc/comma)
+            (let [[flushed rest-ops] (split-with
+                                       #(not (#{:sc/lparen :sc/lbracket} (:kind %)))
+                                       op-stack)
+                  new-output (into output (reverse flushed))
+                  frame      (peek call-stack)
+                  new-calls  (if (and (seq call-stack)
+                                      (#{:call :array} (:kind frame)))
+                               (conj (pop call-stack)
+                                     (update frame :arg-count inc))
+                               call-stack)]
+              (recur (inc i) new-output (vec rest-ops) new-calls))
+
+            ;; ---- Unary operator ----
+            (and (unary? tok) (unary-position? tokens i))
+            ;; Parse next operand recursively, then emit unary op after it
+            (let [[operand-tok next-i]
+                  (loop [j (inc i)]
+                    (if (>= j n)
+                      [nil j]
+                      (let [t (dotck (nth tokens j))]
+                        (cond
+                          (operand? t) [t (inc j)]
+                          (unary? t)   (let [[inner ni] (loop [k (inc j)]
+                                              (if (>= k n) [nil k]
+                                                (let [t2 (dotck (nth tokens k))]
+                                                  (if (operand? t2)
+                                                    [t2 (inc k)]
+                                                    [nil (inc k)]))))]
+                                         ;; emit inner operand, then inner unary — skip for now
+                                         [inner ni])
+                          :else        [nil (inc j)]))))]
+              (recur next-i
+                     (if operand-tok
+                       (conj output operand-tok (assoc tok :unary? true))
+                       output)
+                     op-stack call-stack))
+
+            ;; ---- Binary operator ----
+            (binary? tok)
+            (let [[lp-new rp-new] (prec-table kind)
+                  [flushed rest]  (split-with
+                                    (fn [op]
+                                      (when-let [[lp-top _] (prec-table (:kind op))]
+                                        (>= lp-top rp-new)))
+                                    op-stack)]
+              (recur (inc i)
+                     (into output (reverse flushed))
+                     (vec (cons tok rest))
+                     call-stack))
+
+            :else
+            (recur (inc i) output op-stack call-stack)))))))
