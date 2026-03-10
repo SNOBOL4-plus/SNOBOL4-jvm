@@ -388,195 +388,227 @@
                                     (split-semicolon joined))]
               (recur (inc i) [] acc))))))))
 
-
 ;; ---------------------------------------------------------------------------
 ;; Step 2: Expression parser — shunting-yard
 ;;
 ;; Implements the expression grammar.
-;; op-stack is a vector used as a stack (peek = last, pop = butlast).
-;; Reduce condition: existing-op.lp >= incoming-op.rp  → reduce
+;;
+;; Tokens are plain maps {:kind :text :line} exactly as the lexer produces.
+;; The output is a vector of the same maps in postfix (RPN) order.
+;; Synthetic call/array-ref nodes carry an extra :arg-count key.
+;; Unary operator tokens carry :unary? true.
+;;
+;; Reduce condition (from the language specification):
+;;   while existing-op.lp >= incoming-op.rp  →  reduce
 ;; ---------------------------------------------------------------------------
 
-(def ^:private prec-table
-  {:sc/op-assign    [1  2]
-   :sc/op-question  [2  2]
-   :sc/op-pipe      [3  3]
-   :sc/op-or        [4  4]
-   :sc/op-concat    [5  5]
-   :sc/op-eq        [6  6]  :sc/op-ne        [6  6]
-   :sc/op-lt        [6  6]  :sc/op-gt        [6  6]
-   :sc/op-le        [6  6]  :sc/op-ge        [6  6]
-   :sc/op-str-ident  [6  6] :sc/op-str-differ [6  6]
-   :sc/op-str-lt    [6  6]  :sc/op-str-gt    [6  6]
-   :sc/op-str-le    [6  6]  :sc/op-str-ge    [6  6]
-   :sc/op-str-eq    [6  6]  :sc/op-str-ne    [6  6]
-   :sc/op-plus      [7  7]  :sc/op-minus     [7  7]
-   :sc/op-slash     [8  8]  :sc/op-star      [8  8]  :sc/op-percent   [8  8]
-   :sc/op-caret     [9  10]
-   :sc/op-period    [10 10] :sc/op-dollar    [10 10]})
+;; Precedence table — [lp rp] from the operator table
+(def ^:private ^:const PREC
+  {KIND-ASSIGN   [1  2]    ; right-assoc
+   KIND-QUESTION [2  2]
+   KIND-PIPE     [3  3]
+   KIND-OR       [4  4]
+   KIND-CONCAT   [5  5]
+   KIND-EQ       [6  6]   KIND-NE       [6  6]
+   KIND-LT       [6  6]   KIND-GT       [6  6]
+   KIND-LE       [6  6]   KIND-GE       [6  6]
+   KIND-STR-IDENT [6  6]  KIND-STR-DIFF [6  6]
+   KIND-STR-LT   [6  6]   KIND-STR-GT   [6  6]
+   KIND-STR-LE   [6  6]   KIND-STR-GE   [6  6]
+   KIND-STR-EQ   [6  6]   KIND-STR-NE   [6  6]
+   KIND-PLUS     [7  7]   KIND-MINUS    [7  7]
+   KIND-SLASH    [8  8]   KIND-STAR     [8  8]   KIND-PERCENT  [8  8]
+   KIND-CARET    [9  10]  ; right-assoc
+   KIND-PERIOD   [10 10]  KIND-DOLLAR   [10 10]})
 
-(def ^:private unary-ops
-  #{:sc/op-plus :sc/op-minus :sc/op-star :sc/op-ampersand
-    :sc/op-at   :sc/op-tilde :sc/op-question :sc/op-period :sc/op-dollar})
+;; Unary operator set — ANY("+-*&@~?.$") from the language specification
+(def ^:private ^:const UNARY-OPS
+  #{KIND-PLUS KIND-MINUS KIND-STAR KIND-AMPERSAND
+    KIND-AT KIND-TILDE KIND-QUESTION KIND-PERIOD KIND-DOLLAR})
 
-(def ^:private operand-kinds
-  #{:sc/identifier :sc/integer :sc/real :sc/string})
+;; Operand kinds
+(def ^:private ^:const OPERAND-KINDS
+  #{KIND-IDENT KIND-INTEGER KIND-REAL KIND-STRING})
 
-(defn- sc-operand? [tok] (contains? operand-kinds (:kind tok)))
-(defn- sc-binary?  [tok] (contains? prec-table    (:kind tok)))
-(defn- sc-unary?   [tok] (contains? unary-ops     (:kind tok)))
+;; Synthetic kind constants for postfix call/array nodes
+(def ^:const KIND-CALL      :sc/sc-call)
+(def ^:const KIND-ARRAY-REF :sc/sc-array-ref)
 
-(defn- sc-unary-pos?
-  "True if position i is a unary position."
+;; ---------------------------------------------------------------------------
+;; Internal helpers
+;; ---------------------------------------------------------------------------
+
+(defn- operand? [tok] (contains? OPERAND-KINDS (:kind tok)))
+(defn- binary?  [tok] (contains? PREC          (:kind tok)))
+(defn- unary?   [tok] (contains? UNARY-OPS     (:kind tok)))
+
+(defn- unary-pos?
+  "True when position i in tokens vector is a unary position:
+  start of expression, or preceded by an operator, open-delim, or comma."
   [tokens i]
   (if (zero? i)
     true
-    (let [prev (:kind (nth tokens (dec i)))]
-      (or (= prev :sc/lparen)  (= prev :sc/lbracket) (= prev :sc/comma)
-          (contains? prec-table prev) (contains? unary-ops prev)))))
+    (let [pk (:kind (nth tokens (dec i)))]
+      (or (= pk KIND-LPAREN)
+          (= pk KIND-LBRACKET)
+          (= pk KIND-COMMA)
+          (contains? PREC pk)
+          (contains? UNARY-OPS pk)))))
 
-(defn- sc-dotck [tok]
-  (if (and (= (:kind tok) :sc/real)
-           (string? (:text tok))
-           (clojure.string/starts-with? (:text tok) "."))
+(defn- dotck
+  "Rewrite leading-dot real (.5) to prepend zero (0.5)."
+  [tok]
+  (if (and (= (:kind tok) KIND-REAL)
+           (= \. (.charAt ^String (:text tok) 0)))
     (assoc tok :text (str "0" (:text tok)))
     tok))
 
-;; Stack helpers — vector-as-stack, top = last element
-(defn- stk-push [s x]   (conj s x))
-(defn- stk-peek  [s]    (when (seq s) (last s)))
-(defn- stk-pop   [s]    (when (seq s) (pop s)))  ; pop = remove last
+;; op-stack entries are token maps; the stack top is (peek stk) = last element.
+;; We drain toward a stop predicate using a loop rather than split-with,
+;; so we stay in the same loop/recur rhythm as the rest of the compiler.
 
-(defn- drain-ops-to
-  "Pop ops from op-stack into output until top matches pred or stack empty."
-  [op-stack output stop-pred]
-  (loop [stk op-stack out output]
-    (let [top (stk-peek stk)]
-      (if (or (nil? top) (stop-pred top))
+(defn- drain
+  "Pop ops from op-stack into output until (stop? top) is true or stack empty.
+  Returns [new-stack new-output]."
+  [stk out stop?]
+  (loop [stk stk out out]
+    (let [top (peek stk)]
+      (if (or (nil? top) (stop? top))
         [stk out]
-        (recur (stk-pop stk) (conj out top))))))
+        (recur (pop stk) (conj out top))))))
+
+;; ---------------------------------------------------------------------------
+;; Public entry point
+;; ---------------------------------------------------------------------------
 
 (defn parse-expression
-  "Parse a flat infix token vector into postfix (RPN).
-  Synthetic nodes carry :arg-count; unary ops carry :unary? true."
+  "Parse a flat vector of infix Snocone tokens (Newline/Eof already removed)
+  into a postfix (RPN) vector.  Each element is a token map {:kind :text :line};
+  synthetic CALL/ARRAY-REF nodes add :arg-count, unary ops add :unary? true."
   [tokens]
-  (let [tokens (mapv sc-dotck tokens)
+  (let [tokens (mapv dotck tokens)
         n      (count tokens)]
     (loop [i          0
-           output     []
-           op-stack   []
-           call-stack []]
+           out        []       ; output queue (postfix result)
+           ops        []       ; operator stack (peek = top)
+           calls      []]      ; call-frame stack {:kind :arg-count :out-start}
       (if (>= i n)
-        ;; Drain remaining binary ops
-        (let [[_ out] (drain-ops-to op-stack output (constantly false))]
+        ;; End: drain remaining binary ops
+        (let [[_ out] (drain ops out (constantly false))]
           out)
 
-        (let [tok      (nth tokens i)
-              kind     (:kind tok)
-              next-k   (when (< (inc i) n) (:kind (nth tokens (inc i))))]
+        (let [tok  (nth tokens i)
+              kind (:kind tok)
+              nk   (when (< (inc i) n) (:kind (nth tokens (inc i))))]
           (cond
 
-            ;; ---- Operand ----
-            (sc-operand? tok)
+            ;; ---- Operand -------------------------------------------------------
+            (operand? tok)
             (cond
-              (and (= kind :sc/identifier) (= next-k :sc/lparen))
-              (recur (+ i 2) (conj output tok)
-                     (stk-push op-stack {:kind :sc/lparen :text "(" :line (:line tok)})
-                     (stk-push call-stack {:kind :call :arg-count 0
-                                           :output-start (inc (count output))}))
+              ;; identifier '(' → function call
+              (and (= kind KIND-IDENT) (= nk KIND-LPAREN))
+              (recur (+ i 2)
+                     (conj out tok)
+                     (conj ops {:kind KIND-LPAREN :text "(" :line (:line tok)})
+                     (conj calls {:kind :call :arg-count 0
+                                  :out-start (inc (count out))}))
 
-              (and (= kind :sc/identifier) (= next-k :sc/lbracket))
-              (recur (+ i 2) (conj output tok)
-                     (stk-push op-stack {:kind :sc/lbracket :text "[" :line (:line tok)})
-                     (stk-push call-stack {:kind :array :arg-count 0
-                                           :output-start (inc (count output))}))
+              ;; identifier '[' → array ref
+              (and (= kind KIND-IDENT) (= nk KIND-LBRACKET))
+              (recur (+ i 2)
+                     (conj out tok)
+                     (conj ops {:kind KIND-LBRACKET :text "[" :line (:line tok)})
+                     (conj calls {:kind :array :arg-count 0
+                                  :out-start (inc (count out))}))
 
               :else
-              (recur (inc i) (conj output tok) op-stack call-stack))
+              (recur (inc i) (conj out tok) ops calls))
 
-            ;; ---- Left paren (grouping) ----
-            (= kind :sc/lparen)
-            (recur (inc i) output
-                   (stk-push op-stack tok)
-                   (stk-push call-stack {:kind :group :arg-count 0
-                                         :output-start (count output)}))
+            ;; ---- Left paren (grouping) -----------------------------------------
+            (= kind KIND-LPAREN)
+            (recur (inc i) out
+                   (conj ops tok)
+                   (conj calls {:kind :group :arg-count 0 :out-start (count out)}))
 
-            ;; ---- Right paren ----
-            (= kind :sc/rparen)
-            (let [[stk2 out2] (drain-ops-to op-stack output
-                                #(= (:kind %) :sc/lparen))
-                  stk3   (stk-pop stk2)          ; discard '('
-                  frame  (stk-peek call-stack)
-                  calls2 (stk-pop call-stack)
-                  has?   (> (count out2) (:output-start frame 0))
-                  argc   (if has? (inc (:arg-count frame 0)) 0)
-                  out3   (if (= (:kind frame) :call)
-                           (conj out2 {:kind :sc/sc-call :text "()"
-                                       :line (:line tok) :arg-count argc})
-                           out2)]
-              (recur (inc i) out3 (or stk3 []) (or calls2 [])))
+            ;; ---- Right paren ---------------------------------------------------
+            (= kind KIND-RPAREN)
+            (let [[ops2 out2] (drain ops out #(= (:kind %) KIND-LPAREN))
+                  ops3        (when (seq ops2) (pop ops2))   ; discard '('
+                  frame       (peek calls)
+                  calls2      (when (seq calls) (pop calls))
+                  has-args?   (> (count out2) (:out-start frame 0))
+                  argc        (if has-args? (inc (:arg-count frame 0)) 0)
+                  out3        (if (= (:kind frame) :call)
+                                (conj out2 {:kind KIND-CALL :text "()"
+                                            :line (:line tok) :arg-count argc})
+                                out2)]
+              (recur (inc i) out3 (or ops3 []) (or calls2 [])))
 
-            ;; ---- Left bracket ----
-            (= kind :sc/lbracket)
-            (recur (inc i) output
-                   (stk-push op-stack tok)
-                   (stk-push call-stack {:kind :group :arg-count 0
-                                         :output-start (count output)}))
+            ;; ---- Left bracket --------------------------------------------------
+            (= kind KIND-LBRACKET)
+            (recur (inc i) out
+                   (conj ops tok)
+                   (conj calls {:kind :group :arg-count 0 :out-start (count out)}))
 
-            ;; ---- Right bracket ----
-            (= kind :sc/rbracket)
-            (let [[stk2 out2] (drain-ops-to op-stack output
-                                #(= (:kind %) :sc/lbracket))
-                  stk3   (stk-pop stk2)
-                  frame  (stk-peek call-stack)
-                  calls2 (stk-pop call-stack)
-                  has?   (> (count out2) (:output-start frame 0))
-                  argc   (if has? (inc (:arg-count frame 0)) 0)
-                  out3   (if (= (:kind frame) :array)
-                           (conj out2 {:kind :sc/sc-array-ref :text "[]"
-                                       :line (:line tok) :arg-count argc})
-                           out2)]
-              (recur (inc i) out3 (or stk3 []) (or calls2 [])))
+            ;; ---- Right bracket -------------------------------------------------
+            (= kind KIND-RBRACKET)
+            (let [[ops2 out2] (drain ops out #(= (:kind %) KIND-LBRACKET))
+                  ops3        (when (seq ops2) (pop ops2))
+                  frame       (peek calls)
+                  calls2      (when (seq calls) (pop calls))
+                  has-args?   (> (count out2) (:out-start frame 0))
+                  argc        (if has-args? (inc (:arg-count frame 0)) 0)
+                  out3        (if (= (:kind frame) :array)
+                                (conj out2 {:kind KIND-ARRAY-REF :text "[]"
+                                            :line (:line tok) :arg-count argc})
+                                out2)]
+              (recur (inc i) out3 (or ops3 []) (or calls2 [])))
 
-            ;; ---- Comma ----
-            (= kind :sc/comma)
-            (let [[stk2 out2] (drain-ops-to op-stack output
-                                #(#{:sc/lparen :sc/lbracket} (:kind %)))
-                  frame  (stk-peek call-stack)
-                  calls2 (if (and frame (#{:call :array} (:kind frame)))
-                           (stk-push (stk-pop call-stack)
-                                     (update frame :arg-count inc))
-                           call-stack)]
-              (recur (inc i) out2 stk2 calls2))
+            ;; ---- Comma ---------------------------------------------------------
+            (= kind KIND-COMMA)
+            (let [[ops2 out2] (drain ops out
+                                #(#{KIND-LPAREN KIND-LBRACKET} (:kind %)))
+                  frame       (peek calls)
+                  calls2      (if (and frame (#{:call :array} (:kind frame)))
+                                (conj (pop calls) (update frame :arg-count inc))
+                                calls)]
+              (recur (inc i) out2 ops2 calls2))
 
-            ;; ---- Unary operator ----
-            ;; Strategy: scan forward consuming all chained unary ops + final operand,
-            ;; emit operand first, then unaries in reverse (innermost first).
-            (and (sc-unary? tok) (sc-unary-pos? tokens i))
-            (let [[ops operand j]
-                  (loop [j (inc i) ops [(assoc tok :unary? true)]]
-                    (if (>= j n)
-                      [ops nil j]
-                      (let [t (sc-dotck (nth tokens j))]
-                        (if (sc-operand? t)
-                          [ops t (inc j)]
-                          (if (sc-unary? t)
-                            (recur (inc j) (conj ops (assoc t :unary? true)))
-                            [ops nil j])))))]
-              (recur j
-                     (if operand
-                       (into output (cons operand (reverse ops)))
-                       output)
-                     op-stack call-stack))
+            ;; ---- Unary operator ------------------------------------------------
+            (and (unary? tok) (unary-pos? tokens i))
+            ;; Consume exactly one operand (possibly itself prefixed by unary ops),
+            ;; emit it, then emit this unary op after it — postfix style.
+            (loop [j (inc i) pending-unaries [tok]]
+              (if (>= j n)
+                (recur j out ops calls)
+                (let [t (nth tokens j)]
+                  (cond
+                    ;; Next token is itself a unary op — stack it and keep going
+                    (and (unary? t) (unary-pos? tokens j))
+                    (recur (inc j) (conj pending-unaries t))
 
-            ;; ---- Binary operator ----
-            (sc-binary? tok)
-            (let [[_ rp-new] (prec-table kind)
-                  [stk2 out2] (drain-ops-to op-stack output
-                                (fn [op]
-                                  (let [[lp-top _] (prec-table (:kind op))]
-                                    (not (and lp-top (>= lp-top rp-new))))))]
-              (recur (inc i) out2 (stk-push stk2 tok) call-stack))
+                    ;; Found the operand — emit it, then all pending unaries in order
+                    (operand? t)
+                    (recur (inc j)
+                           (into out (cons (dotck t)
+                                          (map #(assoc % :unary? true) pending-unaries)))
+                           ops calls)
 
+                    ;; Anything else — emit unary with no operand (shouldn't happen)
+                    :else
+                    (recur j
+                           (into out (map #(assoc % :unary? true) pending-unaries))
+                           ops calls)))))
+
+            ;; ---- Binary operator -----------------------------------------------
+            (binary? tok)
+            (let [[_ rp] (PREC kind)
+                  [ops2 out2] (drain ops out
+                                (fn [top]
+                                  (let [[lp-top _] (PREC (:kind top))]
+                                    (not (and lp-top (>= lp-top rp))))))]
+              (recur (inc i) out2 (conj ops2 tok) calls))
+
+            ;; ---- Anything else — skip ------------------------------------------
             :else
-            (recur (inc i) output op-stack call-stack)))))))
+            (recur (inc i) out ops calls)))))))
