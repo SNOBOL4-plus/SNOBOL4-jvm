@@ -16,5 +16,10 @@
   :test-paths ["test"]
   :main ^:skip-aot SNOBOL4clojure.core
   :target-path "target/%s"
-  :profiles {:uberjar {:aot :all
+  :profiles {:uberjar {:main SNOBOL4clojure.main
+                       :aot [SNOBOL4clojure.main]
+                       ;; Only the thin launcher is AOT-compiled (no requires).
+                       ;; All other namespaces load from .clj source at runtime.
+                       ;; This keeps all Greek/symbol names (Sigma+, ?, ?=, etc.)
+                       ;; in env, operators, engine_frame, and match untouched.
                        :jvm-opts ["-Dclojure.compiler.direct-linking=true"]}})

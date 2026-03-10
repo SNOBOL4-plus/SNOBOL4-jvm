@@ -170,10 +170,13 @@
 (def preprocess-includes comp/preprocess-includes)
 
 ;; ── -main ─────────────────────────────────────────────────────────────────────
-(defn -main "SNOBOL4/Clojure." [& _args]
-  (def BED (EVAL '[(POS 0) (| "B" "R") (| "E" "EA") (| "D" "DS") (RPOS 0)]))
-  (pp/pprint BED)
-  (? "READS" BED))
+(defn -main "SNOBOL4/Clojure — run a .sno file." [& args]
+  (if (empty? args)
+    (do (println "Usage: lein run <file.sno>") (System/exit 1))
+    (let [src (slurp (first args))
+          out (vm/run-program! src)]
+      (print out)
+      (flush))))
 
 ;; ── Re-export transpiler (Stage 23B) ─────────────────────────────────────────
 (def transpile          xpile/transpile)
