@@ -553,7 +553,7 @@
             ;; Strategy: scan forward consuming all chained unary ops + final operand,
             ;; emit operand first, then unaries in reverse (innermost first).
             (and (sc-unary? tok) (sc-unary-pos? tokens i))
-            (let [[ops-collected operand j]
+            (let [[ops operand j]
                   (loop [j (inc i) ops [(assoc tok :unary? true)]]
                     (if (>= j n)
                       [ops nil j]
