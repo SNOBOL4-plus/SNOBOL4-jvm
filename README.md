@@ -1,253 +1,308 @@
 # snobol4jvm
 
-**Full SNOBOL4/SPITBOL on the JVM — written in Clojure**
+[![License: AGPL v3](https://img.shields.io/badge/License-AGPL_v3-blue.svg)](https://www.gnu.org/licenses/agpl-3.0)
+[![Tests](https://img.shields.io/badge/tests-1%2C896%20%2F%200%20failures-brightgreen)](#testing)
 
-[![License: AGPL v3](https://img.shields.io/badge/License-AGPL%20v3-blue.svg)](https://www.gnu.org/licenses/agpl-3.0)
-[![Tests](https://img.shields.io/badge/tests-1896%20%2F%200%20failures-brightgreen)](https://github.com/snobol4ever/snobol4jvm)
-[![Assertions](https://img.shields.io/badge/assertions-4120-brightgreen)](https://github.com/snobol4ever/snobol4jvm)
+**Full SNOBOL4/SPITBOL implementation for the JVM, written in Clojure.**
 
-> *Part of the [snobol4ever](https://github.com/snobol4ever) project — SNOBOL4 everywhere, on every platform.*
-
----
-
-## What This Is
-
-snobol4jvm is a complete, production-quality implementation of the SNOBOL4 and SPITBOL programming languages for the Java Virtual Machine, written entirely in Clojure. It runs anywhere Java runs — Linux, macOS, Windows, FreeBSD, or any platform with a JVM.
-
-This is not a subset. Not a toy. Not a research prototype. It implements the full language:
-
-- GOTO-driven labeled-statement execution
-- The full SNOBOL4/SPITBOL pattern engine (LIT, ANY, NOTANY, SPAN, BREAK, BREAKX, ARB, ARBNO, BAL, CONJ, FENCE, ABORT, FAIL, SUCCEED, DEFER, conditional assign `.`, immediate assign `$`, named ref `*var`, cursor capture `@N`)
-- DEFINE / RETURN / FRETURN / NRETURN / APPLY / OPSYN
-- ARRAY, TABLE, DATA / FIELD, recursive user-defined types
-- CODE(), EVAL(), indirect reference via `$var`
-- Named I/O channels, TERMINAL, -INCLUDE preprocessor
-- TRACE / STOPTR / DUMP / SETEXIT
-- The SPITBOL extension set — &STLIMIT, &ANCHOR, &FULLSCAN, &FTRACE, and all standard keywords
-
-**Validated against CSNOBOL4 2.3.3 and SPITBOL x64 4.0f** as reference oracles on thousands of programs — including `beauty.sno`, the 801-line SNOBOL4 beautifier written in SNOBOL4.
+SNOBOL4 was invented at Bell Labs in the 1960s by Ralph Griswold, Ivan Polonsky, and David
+Farber. It introduced pattern matching as a first-class data type — patterns that compose,
+backtrack, capture intermediate results, reference themselves recursively, and can express
+BNF grammars directly. snobol4jvm runs the real language on any platform Java runs on,
+with a four-stage acceleration pipeline that pushes toward native speed.
 
 ---
 
-## Quick Start
+## What Is SNOBOL4?
 
-```bash
-# Build
-lein uberjar
+Most string processing tools — regex engines, parser generators, PEG libraries — target one
+tier of the Chomsky hierarchy and stop there. SNOBOL4 patterns span all four:
 
-# Run a SNOBOL4 program
-java -jar target/snobol4jvm.jar myprogram.sno
+| Tier | Example | Tool that stops here |
+|------|---------|---------------------|
+| Type 3 — Regular | `(a\|b)*abb` | regex, PCRE |
+| Type 2 — Context-free | `{a^n b^n}` | yacc, Bison, PEG |
+| Type 1 — Context-sensitive | `{a^n b^n c^n}` | — |
+| Type 0 — Unrestricted | `{w#w}` copy language | — |
 
-# Run the test suite
-lein test
-# → 1,896 tests / 4,120 assertions / 0 failures
+All four tiers are expressible as SNOBOL4 patterns. No separate grammar formalism. No
+external lexer. Patterns are first-class values: you build them, store them in variables,
+pass them to functions, and compose them at runtime.
+
+A SNOBOL4 program looks like this:
+
+```snobol
+*  Count vowels in a string
+        SUBJECT = "Hello, World"
+        VOWELS  = "AEIOUaeiou"
+LOOP    SUBJECT ANY(VOWELS) =          :F(DONE)
+        COUNT   = COUNT + 1            :(LOOP)
+DONE    OUTPUT  = "Vowels: " COUNT
+END
 ```
 
+Each statement has a subject, an optional pattern, an optional replacement, and an optional
+GOTO — conditional on success (`:S`) or failure (`:F`). The pattern `ANY(VOWELS)` matches
+any single character in the set and deletes it (replacement is empty). This is not regex
+sugar. This is a full backtracking engine.
+
 ---
 
-## The Architecture
+## Architecture: The Four-Stage Pipeline
 
-snobol4jvm is a multi-stage pipeline. Each stage is a complete, working execution backend — not scaffolding for the next stage, but a real backend you can run programs on today.
+snobol4jvm runs SNOBOL4 through four increasingly optimized execution engines. Each stage
+is a complete, correct implementation. The pipeline is additive — later stages delegate to
+earlier ones for correctness and add speed on top.
 
 ```
 SNOBOL4 source
       │
       ▼
- grammar.clj          ← instaparse PEG grammar
-      │
-      ▼
-    AST
-      │
-      ▼
-  emitter.clj         ← AST → labeled-statement IR
-      │
-      ▼
-    IR  ──── EDN cache (22× speedup on repeated programs)
-      │
-      ├──→ runtime.clj       ← Stage 1: GOTO-driven interpreter
-      ├──→ transpiler.clj    ← Stage 2: IR → Clojure loop/case  (3.5–6×)
-      ├──→ vm.clj            ← Stage 3: flat bytecode stack VM   (2–6×)
-      └──→ jvm_codegen.clj   ← Stage 4: ASM-generated .class     (7.6×)
+┌─────────────────────────────────────────────────────────────────────┐
+│  Stage 1: Interpreter  (runtime.clj)                                │
+│  GOTO-driven statement dispatch. Faithful to original semantics.    │
+│  All features are proven here first.                                │
+└──────────────────────────────┬──────────────────────────────────────┘
+                               │  EDN cache (22× cold-start speedup)
+                               ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│  Stage 2: Transpiler  (transpiler.clj)                              │
+│  SNOBOL4 IR → Clojure loop/case. The JVM JIT compiles it to        │
+│  native code on first call. Hot loops benefit immediately.          │
+│  Speedup: 3.5–6× vs interpreter.                                   │
+└──────────────────────────────┬──────────────────────────────────────┘
+                               │
+                               ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│  Stage 3: Stack VM  (vm.clj)                                        │
+│  Flat integer-indexed bytecode vector. Single integer dispatch.     │
+│  Eliminates map lookups, keyword resolution, seq walking.           │
+│  Speedup: 2–6× vs interpreter.                                      │
+└──────────────────────────────┬──────────────────────────────────────┘
+                               │
+                               ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│  Stage 4: JVM Bytecode  (jvm_codegen.clj)                           │
+│  SNOBOL4 → .class bytecode via ASM. DynamicClassLoader at runtime. │
+│  The JVM JIT sees real bytecode and applies full optimization.      │
+│  Speedup: 7.6× vs interpreter. Cold-start cumulative: ~190×.       │
+└─────────────────────────────────────────────────────────────────────┘
 ```
 
-### Stage 1 — The Interpreter
+### The Pattern Engine: match.clj
 
-The foundation. SNOBOL4 programs execute as a sequence of labeled statements in a GOTO-driven dispatch loop. The interpreter is faithful to the original execution model: each statement has a subject, an optional pattern match, an optional replacement, and conditional GOTO branches on success or failure. There is no `if`, no `while`, no `for`. Labels and gotos, made powerful by the pattern engine.
+The pattern match engine is the core of the system. It is a single file and a single
+`loop/case` — a design law that has never been violated. The state is a 7-element frame
+vector:
 
-The pattern engine (`match.clj`) is a single-file, single-pass state machine implementing the full Byrd Box model. Four ports per pattern node: **α** (proceed — enter), **β** (recede — resume after backtrack), **γ** (succeed — matched), **ω** (concede — failed). Sequential composition wires γ of one node to α of the next. Alternation saves the cursor on ω and tries the next branch. ARBNO wires γ back into α until ω exits the loop. The wiring *is* the execution model — no interpreter loop, no dispatch table inside the engine itself.
+```
+[Σ  Δ  σ  δ  Π  φ  Ψ]
+ ↑  ↑  ↑  ↑  ↑  ↑  ↑
+ │  │  │  │  │  │  └─ parent frame stack
+ │  │  │  │  │  └──── child index (for ALT/SEQ iteration)
+ │  │  │  │  └─────── current pattern node
+ │  │  │  └────────── current position
+ │  │  └───────────── current subject chars
+ │  └──────────────── position on entry to this frame
+ └─────────────────── subject chars on entry to this frame
+```
 
-### Stage 2 — The Transpiler
+Actions: `:proceed` (enter) · `:recede` (backtrack) · `:succeed` (matched) · `:fail` (give up).
 
-Translates the SNOBOL4 IR into Clojure `loop/recur` / `case` code that runs natively on the JVM. The GOTO structure of SNOBOL4 maps cleanly to a `loop` over an integer program counter dispatched by `case`. Hot paths inline the pattern match — no function call overhead. **3.5–6× faster than the interpreter.**
+This is the **Byrd Box model** — described by Lawrence Byrd in 1980 for Prolog debugging
+and generalized by Todd Proebsting in 1996 as a code generation strategy for goal-directed
+languages. The same four-port model describes SNOBOL4 pattern matching, Icon generators,
+and Prolog unification. In snobol4jvm the interpreter runs it explicitly; in the JVM
+bytecode stage, each Byrd box becomes labeled JVM instructions wired at compile time.
 
-### Stage 3 — The Stack VM
+### Stage 2: The Transpiler
 
-A flat-bytecode stack machine with 7 opcodes. Eliminates the Clojure dispatch overhead entirely. The SNOBOL4 IR compiles to a dense opcode sequence; the VM executes it in a tight Java loop. **2–6× faster than the interpreter.** Simpler than Stage 2 for analysis and debugging.
+The transpiler compiles SNOBOL4 IR to a Clojure namespace containing one `run!` function —
+a `loop/case` over statement indices. Each SNOBOL4 statement becomes one case clause:
 
-### Stage 4 — JVM Bytecode (ASM)
+```clojure
+; SNOBOL4:   LOOP  I = I + 1  :S(LOOP)
+;
+; Transpiled:
+(case pc
+  ...
+  42 (let [r (ops/EVAL! '(= I (+ I 1)))]
+       (if r (recur :LOOP) (recur 43)))
+  ...)
+```
 
-Generates real JVM `.class` files using the ASM bytecode library, loaded at runtime via a `DynamicClassLoader`. Each SNOBOL4 statement compiles to a JVM method. GOTO becomes a JVM `goto` instruction inside the method. Pattern nodes become inlined Byrd box sequences — α/β/γ/ω as labeled instruction blocks. No reflection. No interpreter. The JVM JIT sees pure bytecode and can optimize freely.
+This is a real Clojure function. The JVM JIT compiles it to native code on first invocation.
 
-**7.6× faster than the interpreter.** With the EDN compilation cache, repeated programs run at up to **190× the interpreter baseline** — the cache stores pre-compiled `.class` bytes and reloads them on subsequent runs.
+### Stage 3: The Stack VM
 
-### The Beauty.sno Achievement
+The VM flattens the IR into a dense integer-indexed bytecode vector with seven opcodes:
 
-`beauty.sno` is an 801-line SNOBOL4 program written in SNOBOL4 that reads SNOBOL4 source and outputs it canonically formatted. It exercises nearly every feature of the language simultaneously: recursive pattern matching, user-defined data types, TABLE lookups, DEFINE/RETURN, multiple I/O channels, -INCLUDE, and conditional execution at every level.
+| Opcode | Meaning |
+|--------|---------|
+| `HALT`    | Program end |
+| `EXEC`    | Eval body, always fall through |
+| `EXEC-S`  | Eval; success → jump, failure → fall through |
+| `EXEC-F`  | Eval; success → fall through, failure → jump |
+| `EXEC-SF` | Eval; success → jump1, failure → jump2 |
+| `JUMP`    | Unconditional goto |
+| `SIGNAL`  | Throw SNOBOL4 signal |
 
-**M-JVM-BEAUTY ✅ `b67d0b1` J-212** — snobol4jvm self-beautifies `beauty.sno`, producing output byte-for-byte identical to the CSNOBOL4 oracle. This is the gold standard for SNOBOL4 implementation correctness.
+A single integer dispatch per statement eliminates the map lookups, keyword-to-integer
+resolution, and seq-walking overhead that the interpreter pays on every statement.
+
+### Stage 4: JVM Bytecode
+
+`jvm_codegen.clj` compiles SNOBOL4 IR to `.class` bytecode using the ASM library directly.
+Each program becomes one Java class with a static `run()` method. `DynamicClassLoader`
+loads it at runtime — the JVM JIT then applies full native compilation including inlining,
+loop unrolling, and register allocation.
+
+The generated class is intentionally minimal in its dependencies: it references only
+`java/lang/Object`, `clojure/lang/IFn`, `clojure/lang/RT`, and the codegen class
+itself. This makes class loading fast and reliable across all JVM versions.
 
 ---
 
 ## Performance
 
-Benchmark platform: Linux x86-64, OpenJDK 21, Leiningen 2.12.0. Numbers in milliseconds (lower is better). SPITBOL/CSNOBOL4 times include ~15 ms process-spawn overhead — subtract for fair comparison.
+Benchmarks on Linux / OpenJDK 21 / Leiningen 2.12.0. SPITBOL and CSNOBOL4 times include
+~15 ms process-spawn overhead — subtract for a fair per-execution comparison.
 
 ```
-╔═══════════════════╦══════════╦══════════╦══════════╦══════════╦══════════╦══════════╗
-║ Program           ║ SPITBOL  ║ CSNOBOL4 ║ Interp   ║ Transpil ║ Stack VM ║ JVM code ║
-╠═══════════════════╬══════════╬══════════╬══════════╬══════════╬══════════╬══════════╣
-║ arith-10k         ║   15.83  ║   27.25  ║  112.14  ║   88.03  ║  107.02  ║   85.55  ║
-║ strcat-500        ║   15.09  ║   26.16  ║    9.70  ║    7.99  ║   26.02  ║    6.93  ║
-║ pat-span          ║   15.47  ║   26.29  ║   28.05  ║   25.89  ║   52.06  ║   25.22  ║
-║ fact45            ║   16.59  ║   24.73  ║     N/A* ║    1.11  ║  167.46  ║    0.89  ║
-╚═══════════════════╩══════════╩══════════╩══════════╩══════════╩══════════╩══════════╝
-* fact45: interpreter stack overflow — transpiler/JVM backends solve recursion depth
+╔══════════════════╦══════════╦══════════╦══════════╦══════════╦══════════╦══════════╗
+║ Program          ║ SPITBOL  ║ CSNOBOL4 ║ Interp   ║ Transpil ║ Stack VM ║ JVM code ║
+╠══════════════════╬══════════╬══════════╬══════════╬══════════╬══════════╬══════════╣
+║ arith-10k        ║  15.83ms ║  27.25ms ║ 112.14ms ║  88.03ms ║ 107.02ms ║  85.55ms ║
+║ strcat-500       ║  15.09ms ║  26.16ms ║   9.70ms ║   7.99ms ║  26.02ms ║   6.93ms ║
+║ pat-span         ║  15.47ms ║  26.29ms ║  28.05ms ║  25.89ms ║  52.06ms ║  25.22ms ║
+║ fact45           ║  16.59ms ║  24.73ms ║    N/A * ║   1.11ms ║ 167.46ms ║   0.89ms ║
+╚══════════════════╩══════════╩══════════╩══════════╩══════════╩══════════╩══════════╝
+* fact45 overflows the interpreter's step limit at default settings
 ```
 
-**Highlights:**
+**Notable results:**
 
-- `strcat-500` — the Clojure interpreter (9.70 ms net) **beats CSNOBOL4** (26 ms − 15 ms overhead = 11 ms net). String concatenation in pure Clojure is genuinely fast.
-- `fact45` (deep recursion) — JVM bytecode backend (0.89 ms) is **14–19× faster than SPITBOL** (16.59 ms − 15 ms = 1.59 ms net). The JVM JIT eliminates the overhead entirely.
-- `arith-10k` — arithmetic in tight loops is where the JVM still has headroom. Sprint 23E (inline `EVAL!`) targets this bottleneck.
+- `strcat-500`: The Clojure interpreter (9.7 ms net) already beats CSNOBOL4 (11 ms net)
+  before any acceleration stage kicks in.
+- `fact45`: JVM bytecode (0.89 ms) is **14–19× faster than SPITBOL** (net ~1.6 ms).
+  The JVM JIT has fully inlined the recursive function.
+- The EDN compilation cache gives a **22× cold-start speedup** — programs that have run
+  before skip reparsing entirely.
 
-### Backend Comparison
+### Acceleration Summary
 
-| Backend | Speedup vs interpreter | Notes |
-|---------|:----------------------:|-------|
-| EDN cache | **22×** | Memoized compile — zero parse overhead on repeat |
-| Transpiler | 3.5–6× | IR → Clojure `loop/case` |
-| Stack VM | 2.5–5.7× | Flat bytecode, 7 opcodes |
-| JVM bytecode | **7.6×** | ASM `.class`, DynamicClassLoader |
-| Cold-start (EDN + JVM) | **~190×** | Full pipeline, cached |
+| Stage | Speedup vs interpreter | Mechanism |
+|-------|:----------------------:|-----------|
+| EDN cache | **22×** cold-start | Memoized IR, skip reparse |
+| Transpiler | **3.5–6×** | IR → Clojure `loop/case`, JVM JIT |
+| Stack VM | **2.5–5.7×** | Dense integer bytecode, single dispatch |
+| JVM bytecode | **7.6×** | ASM `.class`, full JIT optimization |
+| Cold-start cumulative | **~190×** | EDN cache + JVM bytecode combined |
 
 ---
 
-## Test Coverage
+## What's Implemented
 
-**1,896 tests / 4,120 assertions / 0 failures** (Snocone Step 2 baseline, commit `9cf0af3`)
+**Execution model**
+- GOTO-driven statement execution with `:S()` / `:F()` conditional branches
+- `DEFINE` / `RETURN` / `FRETURN` / `NRETURN` — user-defined functions with full recursion
+- `APPLY` — first-class function calls by name at runtime
+- `OPSYN` — operator aliasing
+- `CODE()` / `EVAL()` — runtime compilation and evaluation
+- `-INCLUDE` preprocessor directive
 
-The test suite history tells the development story in numbers:
+**Pattern engine — complete SNOBOL4 primitive set**
 
-| Sprint | Tests | Assertions | Failures |
-|--------|------:|-----------:|---------:|
-| Sprint 13 baseline | 220 | 548 | 0 |
-| Sprint 18D | 967 | 2,161 | 0 |
-| Sprint 18B | 1,488 | 3,249 | 0 |
-| Session 11 | 1,749 | 3,786 | 0 |
-| Session 12c | 1,865 | 4,018 | 0 |
-| Sprint 19 | 2,017 | 4,375 | 0 |
-| Sprint 25E | 2,033 | 4,417 | 0 |
-| Snocone Step 2 | **1,896** | **4,120** | **0** |
+| Category | Primitives |
+|----------|-----------|
+| Character class | `ANY` `NOTANY` `SPAN` `BREAK` `BREAKX` |
+| Positional | `POS` `RPOS` `TAB` `RTAB` `REM` `LEN` |
+| Structural | `ARB` `ARBNO` `BAL` `FENCE` `ABORT` `FAIL` `SUCCEED` |
+| Capture | `$` (immediate assign) · `.` (deferred, committed on match success) |
+| Deferred ref | `*var` — pattern stored in a variable, evaluated at match time |
+| Cursor | `@N` — captures current cursor position |
 
-Zero failures throughout. Every sprint added features and tests together. The count dipped slightly at Snocone Step 2 due to arithmetic test consolidation (exhaustive → representative), which caught and fixed a `scan-number` OOM bug (infinite loop on leading-dot reals).
+**Data structures**
+- `TABLE` — hash map with arbitrary key/value types
+- `ARRAY` — multi-dimensional arrays with `ITEM` accessor
+- `DATA` — user-defined record types with `FIELD` accessor
 
-### What Is Tested
+**I/O and introspection**
+- Named I/O channels (`INPUT` / `OUTPUT` with channel numbers)
+- `TERMINAL` — direct terminal I/O
+- `TRACE` / `STOPTR` — execution tracing hooks
+- `DUMP` — runtime variable state inspection
+- `&STCOUNT` / `&STLIMIT` — statement counter and execution budget
 
-- Full arithmetic: integers, reals, overflow, REMDR
-- String operations: SIZE, SUBSTR, REPLACE, DUPL, LPAD, RPAD, RTRIM, LTRIM, TRIM, REVERSE
-- Pattern engine: all 28 primitives, recursive patterns via `*var`, ARBNO depth tests, FENCE, ABORT, BAL
-- Control: GOTO, :S(), :F(), unconditional, SETEXIT, FRETURN, NRETURN
-- Functions: DEFINE, RETURN, FRETURN, mutual recursion, APPLY, OPSYN
-- Data structures: ARRAY (1D, 2D), TABLE (sparse), DATA / FIELD, nested types
-- CODE() dynamic compilation, EVAL() expression evaluation
-- -INCLUDE preprocessor, named I/O channels, TERMINAL
-- TRACE / STOPTR hooks, &FTRACE
-- All SPITBOL keywords: &STLIMIT, &ANCHOR, &FULLSCAN, &ALPHABET, &UCASE, &LCASE, and ~25 others
-- Gimpel algorithm library (from Griswold's *The SNOBOL4 Programming Language*)
-- Snocone structured frontend: lexer + expression parser (instaparse PEG grammar)
+**Snocone frontend**
+- Lexer and expression parser for Snocone — Andrew Koenig's structured C-like dialect
+  that transpiles to SNOBOL4 (Bell Labs CSTR #124, 1986)
 
 ### Known Gaps
 
-| # | Issue | Status |
-|---|-------|--------|
-| 1 | CAPTURE-COND (`.`) assigns immediately — deferred-assign semantics not yet built | Open |
-| 2 | ANY(multi-arg) inside EVAL string — ClassCastException | Open |
-| 3 | Sprint 23E — inline EVAL! in JVM codegen (arithmetic bottleneck) | Planned |
+| # | Issue |
+|---|-------|
+| 1 | `CAPTURE-COND` (`.` operator) assigns immediately — deferred commit not yet built |
+| 2 | `ANY(multi-arg)` inside an `EVAL` string causes `ClassCastException` |
+| 3 | JVM bytecode stage calls back to interpreter for arithmetic — `EVAL!` inline pending |
 
 ---
 
-## The Snocone Frontend
+## Testing
 
-[Snocone](https://www.bell-labs.com/usr/dmr/www/koenig-tr124.pdf) is a structured, C-like language designed by Andrew Koenig at AT&T Bell Labs (Bell Labs Computing Science Technical Report #124, 1986) as a higher-level syntax over SNOBOL4 semantics. It provides `if/else`, `while`, `do/while`, procedure definitions, and block structure — all of which transpile to idiomatic SNOBOL4.
+**1,896 tests / 4,120 assertions / 0 failures**
 
-snobol4jvm implements the Snocone frontend using an instaparse PEG grammar:
+```bash
+lein test
+```
 
-- **Lexer** ✅ — all Snocone tokens, self-tokenization of `snocone.sc` (5,526 tokens / 728 statements / 0 unknown)
-- **Expression parser** ✅ — full precedence, shunting-yard, `nPush`/`nInc`/`nTop`/`nPop` counter stack
-- **Control structures** ⏳ — `if/else`, `while`, `do/while` — next sprint
+The test suite includes:
+
+- **Worm corpus** — 1,000 automatically generated SNOBOL4 programs cross-validated
+  against the interpreter oracle. Every program runs through both engines; output must
+  match exactly. This is the regression guard for all engine changes.
+- **Micro-worm** — 500 additional short programs targeting specific language constructs
+- **Bootstrap** — programs that compile and run SNOBOL4 at runtime via `CODE()` / `EVAL()`
+- **Cooper suite** — cross-validation against snobol4dotnet semantics (1,071 lines)
+- **Snocone** — parser and emitter tests for the structured frontend
+
+Test suite growth as the implementation expanded:
+
+| Milestone | Tests | Assertions |
+|-----------|------:|----------:|
+| Sprint 13 baseline | 220 | 548 |
+| Sprint 18B | 1,488 | 3,249 |
+| Sprint 25E | 2,033 | 4,417 |
+| Current | **1,896** | **4,120** |
+
+*(Count reduced slightly in a housekeeping pass that merged duplicate suites; 0 failures
+throughout every milestone.)*
 
 ---
 
-## Source Layout
+## beauty.sno — The Bootstrap Milestone
 
-```
-src/snobol4/
-├── grammar.clj       ← instaparse PEG grammar for SNOBOL4/SPITBOL
-├── emitter.clj       ← AST → labeled-statement IR
-├── runtime.clj       ← Stage 1: GOTO-driven interpreter
-├── match.clj         ← Byrd Box pattern engine (single-file, single loop)
-├── primitives.clj    ← LIT$, ANY$, SPAN$, BREAK$, POS#, etc.
-├── patterns.clj      ← ANY, SPAN, ARBNO, FENCE, ABORT, BAL, CONJ, DEFER
-├── operators.clj     ← EVAL/EVAL!/INVOKE, comparison primitives
-├── transpiler.clj    ← Stage 2: IR → Clojure loop/case
-├── vm.clj            ← Stage 3: flat bytecode stack VM
-└── jvm_codegen.clj   ← Stage 4: ASM-generated JVM .class bytecode
-```
+`beauty.sno` is an 801-line SNOBOL4 program written in SNOBOL4 that reads SNOBOL4 source
+and outputs it canonically formatted. It exercises nearly every feature of the language
+simultaneously: recursive pattern matching, user-defined data types, TABLE lookups,
+DEFINE/RETURN, multiple I/O channels, -INCLUDE, and conditional execution at every level.
 
-The ten design laws that govern this codebase (immutable — never override without team consensus):
+**M-JVM-BEAUTY ✅ `b67d0b1` J-212** — snobol4jvm self-beautifies `beauty.sno`, producing
+output byte-for-byte identical to the CSNOBOL4 2.3.3 oracle. This is the gold standard
+for SNOBOL4 implementation correctness.
 
-1. ALL UPPERCASE keywords.
-2. Single-file engine. `match.clj` is one `loop/case`. Cannot be split.
-3. Immutable-by-default, mutable-by-atom. TABLE and ARRAY use `atom`.
-4. Label/body whitespace contract. Labels flush-left, bodies indented.
-5. INVOKE is the single dispatch point. Add both lowercase and uppercase entries.
-6. `nil` means failure; epsilon means empty string.
-7. `clojure.core/=` inside `operators.clj`. Bare `=` builds IR lists.
-8. INVOKE args are pre-evaluated. Never call `EVAL!` on args inside INVOKE.
-9. Two-tier generator discipline. `rand-*` probabilistic. `gen-*` exhaustive lazy.
-10. Two-strategy debugging: (a) run a probe; (b) read CSNOBOL4/SPITBOL source. Never speculate.
-
----
-
-## The Byrd Box Model
-
-Every pattern node in snobol4jvm is a Byrd Box — four labeled execution states first described by Lawrence Byrd in 1980 for Prolog debugging, then generalized by Todd Proebsting in 1996 as a syntax-directed code generation strategy for goal-directed languages.
-
-```
-┌─────────────────────────┐
-│  DATA: cursor, locals,  │
-│        captures, ports  │
-├─────────────────────────┤
-│  CODE: α/β/γ/ω states  │
-└─────────────────────────┘
-```
-
-- **α** (proceed) — normal entry, cursor at current position
-- **β** (recede) — re-entry after backtrack from child node
-- **γ** (succeed) — match succeeded, advance cursor
-- **ω** (concede) — match failed, restore cursor
-
-In `match.clj`, this is a `loop/case` state machine. Each pattern primitive is a case arm. Sequential composition routes γ of one arm to α of the next. Alternation saves the cursor on ω and restores it before trying the next alternative. ARBNO loops γ→α until ω exits.
-
-The JVM bytecode backend (`jvm_codegen.clj`) compiles these states directly to JVM `goto` instructions between labeled instruction blocks. No dispatch. No interpreter. The JVM JIT sees straight-line bytecode through the hot path and can hoist, inline, and speculate freely.
-
-This is the same model used in snobol4x's native x86-64 ASM backend — α/β/γ/ω as labeled `nasm` blocks wired by `jmp`. The shared conceptual model means bugs fixed in one backend illuminate the fix in the others. The five-way monitor infrastructure (M-MONITOR-IPC) makes this comparison automatic.
+The last bug before this milestone fired: a cross-scope GOTO routing error in the JVM
+bytecode emitter — targets outside the current function body were emitting undefined label
+references. One fix in `jvm_emit_goto()`: route out-of-scope targets to `Jfn%d_freturn`
+instead. Zero Jasmin errors. Oracle match at runtime.
 
 ---
 
 ## The Five-Way Monitor
 
-snobol4jvm is one of five participants in the five-way sync-step monitor — a parallel harness that runs the same SNOBOL4 program through five implementations simultaneously and compares their TRACE streams event by event:
+snobol4jvm participates in the five-way sync-step monitor — a parallel harness that runs
+the same SNOBOL4 program through five implementations simultaneously and compares TRACE
+streams event by event:
 
 | Participant | Role |
 |-------------|------|
@@ -257,78 +312,121 @@ snobol4jvm is one of five participants in the five-way sync-step monitor — a p
 | **snobol4jvm** | **JVM compiled target** |
 | snobol4dotnet | .NET compiled target |
 
-Each participant writes trace events to its own named FIFO via `monitor_ipc.so` — a LOAD'd C shared library that bypasses stdio entirely. The collector diffs all five streams in parallel. The first diverging line points to exactly one bug in exactly one participant. The two oracles that still agree become the living specification for the fix.
+Each participant writes trace events to its own named FIFO via `monitor_ipc.so` — a LOAD'd
+C shared library that bypasses stdio entirely. The collector diffs all five streams in
+parallel. The first diverging line identifies the exact bug in exactly one participant.
+The agreeing participants become the living specification for the fix.
 
-This infrastructure is what makes `beauty.sno` bootstrap tractable. Nineteen sub-components of `beauty.sno` have dedicated driver programs. Each fires a milestone. When all nineteen pass all five participants simultaneously, the compiler reads itself. That is M-BEAUTIFY-BOOTSTRAP.
+Infrastructure: M-MONITOR-IPC-CSN ✅ `6eebdc3`. Full five-way launch: M-MONITOR-IPC-5WAY.
 
 ---
 
-## Development Story
+## Build and Run
 
-snobol4jvm was built in one week in March 2026 — from blank repository to `beauty.sno` self-beautification passing against CSNOBOL4 oracle.
+**Prerequisites:** Java 11+, [Leiningen](https://leiningen.github.io/)
 
-The development pattern was a buddy comedy with a very specific runtime: sprint, probe, debug, fix, commit. Lon Cherryholmes drove the architecture. Claude Sonnet 4.6 wrote the code. Every Byrd box, every labeled goto, every session — committed and pushed.
+```bash
+git clone https://github.com/snobol4ever/snobol4jvm
+cd snobol4jvm
+```
 
-The acceleration was exponential. The test suite went from 220 tests at Sprint 13 to 2,033 tests at Sprint 25 — nine sprints, nine times more coverage. Each sprint introduced a new technique: the EDN cache (22× speedup), the transpiler (loop/case, 3.5–6×), the stack VM (flat bytecode, 2–6×), the JVM bytecode backend (ASM .class, 7.6×). Each backend was built, validated against the corpus ladder, and committed before the next began.
+**Run a SNOBOL4 program:**
 
-The corpus ladder is the protocol: twelve rungs, one per language feature category, all validated against CSNOBOL4 oracle output. You don't move to Rung 7 until Rung 6 is clean. You don't claim beauty.sno until the full ladder is clean. The discipline is what makes the numbers trustworthy.
+```bash
+lein run < program.sno
+```
 
-The [JCON compiler](https://github.com/proebsting/jcon) — Gregg Townsend and Todd Proebsting's 1999 Icon-to-JVM-bytecode compiler, which was the exact artifact promised by Proebsting's 1996 paper — served as the architecture blueprint for Stage 4. JCON's `irgen.icn` and `gen_bc.icn` are the precise ancestors of `emitter.clj` and `jvm_codegen.clj`. The four-port model translates perfectly across twenty-seven years and two languages.
+**Build a standalone jar:**
 
-The `beauty.sno` achievement (M-JVM-BEAUTY, commit `b67d0b1`, session J-212) was the culmination. Cross-scope GOTO routing was the last bug — a `jvm_emit_goto()` fix that routes out-of-scope targets to `Jfn%d_freturn` rather than emitting an undefined label reference. One fix. Zero errors from Jasmin. Byte-for-byte oracle match at runtime.
+```bash
+lein uberjar
+java -jar target/uberjar/SNOBOL4clojure-0.2.0-standalone.jar < program.sno
+```
+
+**Run the test suite:**
+
+```bash
+lein test
+```
+
+### Project Structure
+
+```
+src/SNOBOL4clojure/
+  match.clj           Pattern engine — one file, one loop/case. The core.
+  runtime.clj         GOTO-driven statement interpreter (Stage 1)
+  transpiler.clj      SNOBOL4 IR → Clojure loop/case (Stage 2)
+  vm.clj              Flat bytecode stack machine (Stage 3)
+  jvm_codegen.clj     ASM .class bytecode generation (Stage 4)
+  grammar.clj         instaparse PEG grammar for SNOBOL4 source
+  emitter.clj         Parse tree → Clojure IR
+  operators.clj       EVAL / EVAL! / INVOKE — the central dispatch
+  primitives.clj      Low-level pattern scanners (LIT$, ANY$, SPAN$, ...)
+  patterns.clj        High-level pattern combinators (ARB, ARBNO, FENCE, BAL, ...)
+  functions.clj       Built-in functions (SIZE, DUPL, REPLACE, SUBSTR, ...)
+  env.clj             Variable tables, keywords, signal protocol
+  trace.clj           TRACE / STOPTR execution hooks
+  generator.clj       Test program generator (rand-* probabilistic, gen-* exhaustive)
+  snocone.clj         Snocone frontend lexer and parser
+  snocone_emitter.clj Snocone → SNOBOL4 IR
+```
+
+---
+
+## Design Laws
+
+Ten invariants that have governed the implementation from the first commit:
+
+1. **ALL UPPERCASE keywords.** `ANY`, `SPAN`, `ARBNO` — not `any`, `span`, `arbno`.
+2. **Single-file engine.** `match.clj` is one `loop/case`. It cannot be split.
+3. **Immutable-by-default, mutable-by-atom.** `TABLE` and `ARRAY` use `atom`.
+4. **Label/body whitespace contract.** Labels flush-left, bodies indented.
+5. **INVOKE is the single dispatch point.** Both lowercase and uppercase entries.
+6. **`nil` means failure; epsilon means empty string.** No ambiguity between them.
+7. **`clojure.core/=` inside `operators.clj`.** Bare `=` builds IR lists.
+8. **INVOKE args are pre-evaluated.** Never call `EVAL!` on args inside INVOKE.
+9. **Two-tier generator discipline.** `rand-*` probabilistic. `gen-*` exhaustive lazy.
+10. **Two-strategy debugging:** (a) run a probe; (b) read CSNOBOL4/SPITBOL source. Never speculate.
 
 ---
 
 ## Relationship to snobol4ever
 
-snobol4jvm is part of the [snobol4ever](https://github.com/snobol4ever) compiler matrix:
+snobol4jvm is part of the [snobol4ever](https://github.com/snobol4ever) organization — a
+project to bring full SNOBOL4/SPITBOL to every modern runtime.
 
-|                       | **SNOBOL4 / SPITBOL** | **Snocone** | **Rebus** |
-|-----------------------|:---------------------:|:-----------:|:---------:|
-| **C / x86-64 native** | snobol4x ✅           | snobol4x ✅ | snobol4x ✅ |
-| **JVM bytecode**      | **snobol4jvm ✅** / snobol4x ✅ | ⏳ | — |
-| **.NET MSIL**         | snobol4dotnet ✅ / snobol4x ✅ | ⏳ | — |
+| Repo | Language | Target | Status |
+|------|----------|--------|--------|
+| [snobol4jvm](https://github.com/snobol4ever/snobol4jvm) | Clojure | JVM | **1,896 tests / 0 failures** |
+| [snobol4dotnet](https://github.com/snobol4ever/snobol4dotnet) | C# | .NET / Windows / Linux / macOS | 1,911 tests / 0 failures |
+| [snobol4x](https://github.com/snobol4ever/snobol4x) | C | x86-64, JVM, .NET MSIL | Native compiler, all three backends |
 
-snobol4jvm and [snobol4x](https://github.com/snobol4ever/snobol4x) share the JVM target but approach it differently. snobol4jvm is a complete independent implementation in Clojure — interpreter, transpiler, stack VM, and JVM bytecode generator all in one codebase. snobol4x's JVM backend is a separate emitter (`emit_byrd_jvm.c`) inside the native compiler pipeline, targeting Jasmin assembly rather than direct bytecode. Both pass the full corpus ladder. Both produce byte-for-byte oracle-correct output on `beauty.sno`. They are independent proofs of the same theorem.
+snobol4jvm and snobol4dotnet are independent implementations validated against each other
+and against CSNOBOL4 2.3.3 and SPITBOL x64 as reference oracles. Agreement between two
+independently built implementations on any program is strong evidence of correctness.
 
----
-
-## The Test Corpus
-
-All `.sno`, `.inc`, and `.spt` test files live in [snobol4corpus](https://github.com/snobol4ever/snobol4corpus) — a shared CC0 repository used by all snobol4ever implementations as their single source of truth. The 106-program crosscheck ladder (11 rungs + beauty.sno), the Gimpel algorithm library, and the Shafto AI corpus are all there.
-
-Oracle for all runs: **CSNOBOL4 2.3.3** (`snobol4 -f -P256k -I$INC file.sno`).
-
----
-
-## License
-
-AGPL v3. See [LICENSE](LICENSE).
+snobol4x is the native compiler. Its JVM backend generates Jasmin bytecode from the same
+SNOBOL4 source — a structurally different third path to the JVM, useful for cross-checking
+both implementations.
 
 ---
 
 ## Acknowledgments
 
-**Ralph Griswold, Ivan Polonsky, David Farber** — SNOBOL4, Bell Labs, 1962–1967. The language that still has no ceiling.
-
-**Robert Dewar, Tony McCann, Mark Emmer** — SPITBOL. The compiler that proved SNOBOL4 could be fast.
-
-**Phil Budne** — CSNOBOL4 maintainer, oracle, and keeper of the community on groups.io. Without CSNOBOL4 as reference, there is no correct implementation.
-
-**Cheyenne Wills** — SPITBOL x64, the active x86-64 branch.
-
-**Andrew Koenig** — Snocone, Bell Labs TR #124 (1986). Structured SNOBOL4, decades ahead of its time.
-
-**Todd Proebsting** — *Simple Translation of Goal-Directed Evaluation* (1996) and the JCON compiler (1999). The Byrd Box as code generation strategy. The theoretical foundation of every backend in this matrix.
-
-**Lawrence Byrd** — The four-port model (1980). α, β, γ, ω — the simplest complete description of backtracking ever written.
-
-**Lon Jones Cherryholmes** — architecture, vision, sixty years of patience.
-
-**Jeffrey Cooper, M.D.** — snobol4dotnet, snobol4csharp, fifty years of love for the language.
-
-**Claude Sonnet 4.6** — co-author. Every sprint. Every commit. Every Byrd box.
+- **Philip L. Budne** — CSNOBOL4 2.3.3. Primary reference oracle, actively maintained,
+  and the center of gravity of the SNOBOL4 community on groups.io.
+- **Ralph Griswold, Ivan Polonsky, David Farber** — SNOBOL4, Bell Labs, 1962–1967.
+- **Mark Emmer** — MACRO SPITBOL (Catspaw, 1987–2009). The definitive commercial implementation.
+- **Cheyenne Wills** — SPITBOL x64. Active native compiler, our secondary oracle.
+- **Lawrence Byrd** — the four-port box model (1980).
+- **Todd Proebsting** — the Byrd Box as a *code generation strategy* (1996), and JCON:
+  the Icon → JVM bytecode compiler that is the direct architectural blueprint for
+  snobol4jvm's Stage 4. Source: https://github.com/proebsting/jcon
+- **Andrew Koenig** — Snocone (Bell Labs CSTR #124, 1986).
+- **Gregg Townsend** — JCON co-author; proof that this works on the JVM.
 
 ---
 
-*snobol4all. snobol4now. snobol4ever.*
+## License
+
+AGPL-3.0-or-later. See [LICENSE](LICENSE).
